@@ -16,6 +16,10 @@ BuildRequires:  coreutils
 BuildRequires:  findutils
 
 Requires:       bash
+Requires:       dnf5
+Requires:       dnf5-plugins
+Requires:       fedora-workstation-repositories
+Requires:       rpm
 Requires:       coreutils
 Requires:       findutils
 Requires:       grep
@@ -107,7 +111,8 @@ Requires:       tesseract
 Requires:       tesseract-langpack-eng
 Requires:       v4l-utils
 Requires:       ImageMagick
-Requires:       ffmpeg-free
+# Fedora ffmpeg-free and RPM Fusion ffmpeg both provide this executable.
+Requires:       /usr/bin/ffmpeg
 Requires:       libxkbcommon-utils
 Requires:       python3-gobject
 Requires:       python3-dbus
