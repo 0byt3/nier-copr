@@ -22,6 +22,7 @@ Requires:       grep
 Requires:       sed
 Requires:       gawk
 Requires:       util-linux
+Requires:       util-linux-script
 Requires:       procps-ng
 Requires:       diffutils
 Requires:       tar
@@ -52,8 +53,9 @@ Requires:       hyprpaper
 Requires:       uwsm
 Requires:       quickshell
 Requires:       ghostty
-Requires:       gdm
-Requires:       accountsservice
+Requires:       greetd
+Requires:       cage
+Requires:       wlr-randr
 Requires:       xdg-desktop-portal
 Requires:       xdg-desktop-portal-gtk
 Requires:       xdg-terminal-exec
