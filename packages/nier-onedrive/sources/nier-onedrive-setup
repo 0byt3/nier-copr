@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""Set up independent OneDrive accounts and their Nier widgets."""
+from __future__ import annotations
+
+import argparse
+import curses
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ACCOUNT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+CLIENT = "/usr/bin/onedrive"
+DEFAULT_SHELL = Path("/usr/local/share/nier/config/nier/shell.json")
+
+
+class Cancelled(Exception):
+    pass
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")).expanduser().resolve()
+
+
+def accounts_root() -> Path:
+    return config_home() / "nier/onedrive/accounts"
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+# Match abraunegg/onedrive's public application and national-cloud endpoints.
+# Credentials stay in memory; identity lookup never rewrites the client's token.
+DEFAULT_APPLICATION_ID = "d50ca740-c83f-4d1b-b616-12c519384f0c"
+CLOUDS = {
+    "": ("login.microsoftonline.com", "graph.microsoft.com"),
+    "USL4": ("login.microsoftonline.us", "graph.microsoft.us"),
+    "USL5": ("login.microsoftonline.us", "dod-graph.microsoft.us"),
+    "DE": ("login.microsoftonline.de", "graph.microsoft.de"),
+    "CN": ("login.chinacloudapi.cn", "microsoftgraph.chinacloudapi.cn"),
+}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def identity_json(request: urllib.request.Request) -> dict:
+    # Do not forward a credential-bearing request through an HTTP redirect.
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("Identity response is too large")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid identity response")
+    return data
+
+
+def valid_email(value) -> str:
+    if (isinstance(value, str) and len(value) <= 320 and "@" in value
+            and not any(c.isspace() or ord(c) < 32 for c in value)):
+        return value
+    return ""
+
+
+def detect_account_email(client: Path) -> str:
+    options = {}
+    if (client / "config").is_file():
+        for line in (client / "config").read_text().splitlines():
+            match = re.fullmatch(r'\s*(application_id|azure_tenant_id|azure_ad_endpoint)\s*=\s*"([^"\r\n]*)"\s*(?:#.*)?', line)
+            if match:
+                options[match[1]] = match[2]
+    cloud = options.get("azure_ad_endpoint", "")
+    if cloud not in CLOUDS:
+        raise ValueError("Unsupported Microsoft cloud")
+    authority, graph = CLOUDS[cloud]
+    tenant = options.get("azure_tenant_id") or "common"
+    application = options.get("application_id") or DEFAULT_APPLICATION_ID
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", tenant) or not re.fullmatch(r"[A-Za-z0-9-]+", application):
+        raise ValueError("Invalid Microsoft application configuration")
+    refresh_token = (client / "refresh_token").read_text().strip()
+    if not refresh_token:
+        raise ValueError("Sign in before detecting the Microsoft account")
+    body = urllib.parse.urlencode({"client_id": application,
+        "grant_type": "refresh_token", "refresh_token": refresh_token}).encode()
+    token = identity_json(urllib.request.Request(
+        f"https://{authority}/{tenant}/oauth2/v2.0/token", data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}))
+    access = token.get("access_token")
+    if not isinstance(access, str) or not access or any(c.isspace() for c in access):
+        raise ValueError("Microsoft did not provide an access token")
+    headers = {"Authorization": "Bearer " + access, "Accept": "application/json"}
+    drive = identity_json(urllib.request.Request(
+        f"https://{graph}/v1.0/me/drive?$select=owner", headers=headers))
+    owner = drive.get("owner", {})
+    user = owner.get("user", {}) if isinstance(owner, dict) else {}
+    email = valid_email(user.get("email")) if isinstance(user, dict) else ""
+    if email:
+        return email
+    # Some personal drives omit owner.email. Profile access may already be
+    # consented; never request additional scopes or launch a browser here.
+    profile = identity_json(urllib.request.Request(
+        f"https://{graph}/v1.0/me?$select=mail,userPrincipalName", headers=headers))
+    return valid_email(profile.get("mail")) or valid_email(profile.get("userPrincipalName"))
+
+
+def update_identity(directory: Path, data: dict) -> bool:
+    try:
+        email = detect_account_email(directory / "client")
+    except (OSError, ValueError):
+        # Network/authentication failures must not discard a saved identity or
+        # print exception bodies that might contain credential material.
+        return False
+    if not email:
+        return False
+    data.update(email=email, emailSource="microsoft")
+    return True
+
+
+def refresh_account_identity(identifier: str) -> bool:
+    account = next((item for item in read_accounts() if item["id"] == identifier), None)
+    if not account or not ACCOUNT_ID.fullmatch(identifier):
+        raise ValueError("Choose a configured Nier OneDrive account")
+    path = accounts_root() / identifier / "account.json"
+    previous = path.read_text()
+    data = json.loads(previous)
+    if not update_identity(path.parent, data):
+        return False
+    if path.read_text() != previous:
+        raise ValueError("Account metadata changed; try detecting its identity again")
+    atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def read_accounts() -> list[dict]:
+    accounts = []
+    for path in sorted(accounts_root().glob("*/account.json")):
+        data = json.loads(path.read_text())
+        if (not isinstance(data, dict) or not ACCOUNT_ID.fullmatch(str(data.get("id", "")))
+                or data["id"] != path.parent.name or not isinstance(data.get("label"), str)
+                or not isinstance(data.get("syncDir"), str)):
+            raise ValueError(f"Invalid account metadata: {path}")
+        accounts.append({"id": data["id"], "label": data["label"],
+                         "email": str(data.get("email", "")), "syncDir": data["syncDir"],
+                         "unit": f"nier-onedrive@{data['id']}.service",
+                         "eventsDirectory": f"nier-onedrive-{data['id']}"})
+    # Keep the previously packaged default-account service visible, without
+    # copying its credentials or changing its configuration.
+    legacy = config_home() / "onedrive"
+    if (legacy / "refresh_token").is_file():
+        sync_dir = Path.home() / "OneDrive"
+        if (legacy / "config").exists():
+            for line in (legacy / "config").read_text().splitlines():
+                match = re.match(r'^\s*sync_dir\s*=\s*"(.*)"\s*$', line)
+                if match:
+                    sync_dir = Path(os.path.expandvars(os.path.expanduser(match[1])))
+        accounts.insert(0, {"id": "default", "label": "Default", "email": "",
+                            "syncDir": str(sync_dir.resolve()), "unit": "onedrive.service",
+                            "eventsDirectory": "nier-onedrive"})
+    return accounts
+
+
+def validate_folder(value: str, accounts: list[dict]) -> Path:
+    if not value.strip() or any(ord(c) < 32 or c in ('"', '\\') for c in value):
+        raise ValueError("Choose a folder path without quotes, backslashes or control characters.")
+    folder = Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+    if folder == Path.home().resolve() or folder in Path.home().resolve().parents:
+        raise ValueError("Choose a dedicated folder, not your home folder or a parent of it.")
+    # Client credentials, databases and shell preferences must never be synced.
+    private = config_home()
+    if folder == private or folder in private.parents or private in folder.parents:
+        raise ValueError("Choose a folder outside your configuration directory.")
+    for account in accounts:
+        other = Path(account["syncDir"]).resolve()
+        if folder == other or folder in other.parents or other in folder.parents:
+            raise ValueError(f"This folder overlaps the {account['label']} sync folder.")
+    if folder.exists() and (not folder.is_dir() or any(folder.iterdir())):
+        raise ValueError("Choose a new or empty folder so existing files are not uploaded unexpectedly.")
+    return folder
+
+
+def create_account(label: str, email: str, folder: Path) -> tuple[Path, dict]:
+    if not label.strip() or len(label) > 80 or len(email) > 320 or any(ord(c) < 32 for c in label + email):
+        raise ValueError("Enter a label of 1–80 characters without control characters.")
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:32] or "account"
+    identifier = slug + "-" + secrets.token_hex(4)
+    directory = accounts_root() / identifier
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    client_dir = directory / "client"
+    client_dir.mkdir(mode=0o700)
+    # Set only the required path; upstream defaults remain in effect.
+    threads = max(1, min(8, os.cpu_count() or 1))
+    atomic_write(client_dir / "config", f'sync_dir = "{folder}"\nthreads = "{threads}"\n')
+    atomic_write(directory / "monitor-wrapper.toml",
+                 '[onedrive]\nconfig_dir = ' + json.dumps(str(client_dir), ensure_ascii=False) + '\n')
+    data = {"id": identifier, "label": label.strip(), "email": email.strip(), "syncDir": str(folder)}
+    atomic_write(directory / "setup.json", json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return directory, data
+
+
+def pending_accounts() -> list[tuple[Path, dict]]:
+    pending = []
+    for path in sorted(accounts_root().glob("*/setup.json")):
+        directory = path.parent
+        if (directory / "account.json").exists() or not (directory / "client/refresh_token").is_file():
+            continue
+        data = json.loads(path.read_text())
+        if (not isinstance(data, dict) or data.get("id") != directory.name
+                or not ACCOUNT_ID.fullmatch(directory.name)
+                or not isinstance(data.get("label"), str) or not isinstance(data.get("syncDir"), str)):
+            raise ValueError(f"Invalid pending setup metadata: {path}")
+        pending.append((directory, data))
+    return pending
+
+
+def publish_account(directory: Path, data: dict) -> None:
+    if not (directory / "client/refresh_token").is_file():
+        raise ValueError("OneDrive did not save an authentication token. The account was not added.")
+    atomic_write(directory / "account.json", json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    (directory / "setup.json").unlink(missing_ok=True)
+
+
+def add_bar_widget(account_id: str) -> None:
+    # The current Nier shell reads this location (independently of XDG_CONFIG_HOME).
+    path = Path.home() / ".config/nier/shell.json"
+    previous = path.read_text() if path.exists() else None
+    if previous is None:
+        if not DEFAULT_SHELL.is_file():
+            raise ValueError("Nier shell defaults are unavailable; add the widget after installing Nier.")
+        data = json.loads(DEFAULT_SHELL.read_text())
+    else:
+        data = json.loads(previous)
+    bar = data.setdefault("bar", {})
+    layout = bar.setdefault("layout", {})
+    for section in ("left", "center", "right"):
+        layout.setdefault(section, [])
+        if not isinstance(layout[section], list):
+            raise ValueError("Invalid bar layout; existing preferences were left unchanged.")
+    placeholder = None
+    for entries in layout.values():
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            if entry == "nier.onedrive":
+                placeholder = (entries, index)
+            elif isinstance(entry, dict) and entry.get("id") == "nier.onedrive":
+                if entry.get("account") == account_id:
+                    return
+                if not entry.get("account"):
+                    placeholder = (entries, index)
+    if placeholder:
+        entries, index = placeholder
+        entry = entries[index]
+        entries[index] = {**(entry if isinstance(entry, dict) else {"id": entry}), "account": account_id}
+    else:
+        layout["right"].append({"id": "nier.onedrive", "account": account_id})
+    disabled = data.get("disabledPlugins", [])
+    if isinstance(disabled, list):
+        data["disabledPlugins"] = [item for item in disabled if item != "nier.onedrive"]
+    # Refuse to replace preferences edited while the wizard was reading them.
+    if (path.read_text() if path.exists() else None) != previous:
+        raise ValueError("Bar preferences changed. Run the wizard again to add the widget.")
+    if previous is not None:
+        backup = path.with_name("shell.json.before-onedrive-" + secrets.token_hex(4))
+        atomic_write(backup, previous)
+    atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def systemctl(*arguments: str) -> None:
+    subprocess.run(["systemctl", "--user", *arguments], check=True)
+
+
+class Tui:
+    def __init__(self, screen):
+        self.screen = screen
+        self.screen.keypad(True)
+        curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+
+    def draw(self, title: str, lines: list[str], hint="Enter: continue   Esc: cancel") -> None:
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        def put(y, text, style=0):
+            if 0 <= y < height - 1:
+                self.screen.addnstr(y, 2, text, max(0, width - 4), style)
+        put(1, "OneDrive · " + title, curses.A_BOLD)
+        row = 3
+        for line in lines:
+            for part in textwrap.wrap(line, max(10, width - 6)) or [""]:
+                put(row, part)
+                row += 1
+        put(height - 2, hint, curses.A_DIM)
+        self.screen.refresh()
+
+    def key(self):
+        key = self.screen.get_wch()
+        if key in ("\x1b", "\x03"):
+            raise Cancelled()
+        return key
+
+    def message(self, title, lines):
+        while True:
+            self.draw(title, lines)
+            if self.key() in ("\n", "\r", curses.KEY_ENTER):
+                return
+
+    def ask(self, title: str, prompt: str, default="") -> str:
+        value = default
+        while True:
+            self.draw(title, [prompt, "", value + "▏"], "Type your answer   Enter: continue   Ctrl+U: clear   Esc: cancel")
+            key = self.key()
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                return value.strip()
+            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                value = value[:-1]
+            elif key == "\x15":
+                value = ""
+            elif isinstance(key, str) and key.isprintable() and len(value) < 4096:
+                value += key
+
+    def choose(self, title: str, options: list[str], details=None) -> int:
+        selected = 0
+        while True:
+            lines = list(details or []) + [""]
+            height, _ = self.screen.getmaxyx()
+            count = max(1, height - len(lines) - 7)
+            start = max(0, selected - count + 1)
+            lines += [("› " if i == selected else "  ") + options[i]
+                      for i in range(start, min(len(options), start + count))]
+            self.draw(title, lines, "↑/↓: choose   Enter: select   Esc: cancel")
+            key = self.key()
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                return selected
+            if key in (curses.KEY_UP, "k"):
+                selected = (selected - 1) % len(options)
+            if key in (curses.KEY_DOWN, "j", "\t"):
+                selected = (selected + 1) % len(options)
+
+    def command(self, title: str, command: list[str]) -> bool:
+        self.message(title, ["The terminal will show OneDrive's output. Follow its prompts, then return here."])
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            result = subprocess.run(command)
+            input("\nPress Enter to return to setup… ")
+            return result.returncode == 0
+        finally:
+            curses.reset_prog_mode()
+            self.screen.refresh()
+
+
+def add_account(ui: Tui) -> None:
+    label = ui.ask("Add account · 1 of 4", "Account label (for example Personal or Work)")
+    email = ui.ask("Add account · 1 of 4", "Email address (optional fallback; detected automatically after sign-in)")
+    default_name = re.sub(r"[^\w -]", "", label).strip() or "Account"
+    while True:
+        value = ui.ask("Sync folder · 2 of 4", "Choose a new or empty folder for this account", str(Path.home() / ("OneDrive-" + default_name)))
+        try:
+            folder = validate_folder(value, read_accounts() + [data for _, data in pending_accounts()])
+            break
+        except ValueError as error:
+            ui.message("Choose another folder", [str(error)])
+    ui.message("Sign in · 3 of 4", [f"Account: {label}", f"Sync folder: {folder}",
+               "Sign in with the intended Microsoft account in your browser. No files will be synced yet."])
+    directory, data = create_account(label, email, folder)
+    complete_account(ui, directory, data)
+
+
+def complete_account(ui: Tui, directory: Path, data: dict) -> None:
+    folder = Path(data["syncDir"])
+    try:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not (directory / "client/refresh_token").is_file() and not ui.command("Microsoft sign-in", [CLIENT, "--confdir=" + str(directory / "client")]):
+            raise ValueError("Sign-in failed. The account has not been added.")
+        if update_identity(directory, data):
+            atomic_write(directory / "setup.json", json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        if not ui.command("Preview synchronization · 4 of 4", [CLIENT, "--confdir=" + str(directory / "client"), "--sync", "--dry-run"]):
+            raise ValueError("The synchronization preview failed. Your sign-in is saved; select Resume setup to try again.")
+        publish_account(directory, data)
+    except BaseException:
+        # Keep authenticated setup resumable after preview errors or cancellation.
+        # Failed sign-in without a token still removes only its private config.
+        if not (directory / "account.json").exists() and not (directory / "client/refresh_token").is_file():
+            shutil.rmtree(directory)
+        raise
+    unit = f"nier-onedrive@{data['id']}.service"
+    choice = ui.choose("Account ready", ["Save without starting synchronization", "Enable and start synchronization"],
+                       [f"Account: {data['label']}", f"Microsoft account: {data.get('email') or 'Not detected'}", f"Folder: {folder}",
+                        "Starting synchronization downloads cloud files and uploads local changes."])
+    if choice == 1:
+        systemctl("daemon-reload")
+        systemctl("enable", "--now", unit)
+    if ui.choose("Account widget", ["Add a widget for this account", "Keep my bar unchanged"]) == 0:
+        add_bar_widget(data["id"])
+    ui.message("Account added", [data["label"], "You can add another account or manage its service from this wizard."])
+
+
+def wizard(ui: Tui) -> None:
+    while True:
+        try:
+            accounts = read_accounts()
+            pending = pending_accounts()
+            options = (["Add an account"] + [f"Resume {data['label']} setup" for _, data in pending]
+                       + [f"{item['label']}  {item['email']}".strip() for item in accounts] + ["Exit"])
+            choice = ui.choose("Accounts", options)
+            if choice == len(options) - 1:
+                return
+            if choice == 0:
+                add_account(ui)
+                continue
+            if choice <= len(pending):
+                directory, data = pending[choice - 1]
+                complete_account(ui, directory, data)
+                continue
+            account = accounts[choice - len(pending) - 1]
+            action = ui.choose(account["label"], ["Add this account's bar widget", "Enable and start service", "Stop service", "Disable automatic startup and stop", "Detect Microsoft account email", "Back"],
+                               [account["email"], "Sync folder: " + account["syncDir"]])
+            if action == 0:
+                add_bar_widget(account["id"])
+            elif action == 1:
+                systemctl("daemon-reload")
+                systemctl("enable", "--now", account["unit"])
+            elif action == 2:
+                systemctl("stop", account["unit"])
+            elif action == 3:
+                systemctl("disable", "--now", account["unit"])
+            elif action == 4:
+                detected = refresh_account_identity(account["id"])
+                ui.message("Microsoft account", ["Email address updated." if detected else "Could not detect the email address. Try again when connected; saved details were preserved."])
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            ui.message("Unable to finish", [str(error), "Saved accounts and authenticated unfinished setups remain available in the account list."])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--refresh-identity", metavar="ACCOUNT", help="Detect and save a configured account’s Microsoft email")
+    modes.add_argument("--list", action="store_true", help="List configured accounts without reading credentials")
+    parser.add_argument("--json", action="store_true", help="Return account metadata as JSON (with --list)")
+    args = parser.parse_args()
+    try:
+        if args.list:
+            accounts = read_accounts()
+            print(json.dumps(accounts, ensure_ascii=False) if args.json else "\n".join(f"{a['id']}\t{a['label']}\t{a['email']}" for a in accounts))
+            return 0
+        if args.refresh_identity:
+            if args.json:
+                parser.error("--json requires --list")
+            with (accounts_root().parent / ".setup.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not refresh_account_identity(args.refresh_identity):
+                    print("Microsoft account identity could not be detected; saved metadata was preserved.", file=sys.stderr)
+                    return 1
+            print("Microsoft account email updated.")
+            return 0
+        if args.json:
+            parser.error("--json requires --list")
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error("Run this wizard in a terminal (or use --list --json).")
+        os.umask(0o077)
+        root = accounts_root()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (root.parent / ".setup.lock").open("w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("OneDrive setup is already open in another terminal.", file=sys.stderr)
+                return 1
+            curses.wrapper(lambda screen: wizard(Tui(screen)))
+        return 0
+    except Cancelled:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, ValueError, curses.error) as error:
+        print(f"OneDrive setup: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

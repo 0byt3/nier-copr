@@ -2,3 +2,4 @@
 .state/
 *.src.rpm
 *.rpm
+__pycache__/

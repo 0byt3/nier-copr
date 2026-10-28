@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "nier.onedrive",
+  "name": "OneDrive",
+  "version": "1.3.5",
+  "author": "eag-erolleman",
+  "description": "OneDrive accounts, service status and synchronization activity",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OneDrive",
+    "description": "View OneDrive service status and current synchronization activity",
+    "category": "Files",
+    "allowMultiple": true,
+    "defaultSection": "right"
+  }
+}

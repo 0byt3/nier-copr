@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Supervise the OneDrive monitor client and expose QML-friendly events."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import tomllib
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, BinaryIO
+
+
+SCHEMA_VERSION = 1
+SIGNALS_TO_FORWARD = tuple(
+    signal_number
+    for signal_number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
+    if signal_number is not None
+)
+
+
+def event_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def decoded_message(raw_line: bytes) -> str:
+    return raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+
+
+def write_all(file_descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(file_descriptor, view)
+        view = view[written:]
+
+
+class EventClassifier:
+    """Turn known abraunegg/onedrive client messages into stable UI events."""
+
+    transfer_pattern = re.compile(
+        r"^(?P<operation>Uploading|Downloading)(?: (?:new|modified))? file:?\s+"
+        r"(?P<path>.+?)(?:\s+\.\.\.\s*(?P<progress>\d{1,3})%\s*)?(?P<done>done)?$",
+        re.IGNORECASE,
+    )
+    progress_pattern = re.compile(
+        r"^(?P<operation>Uploading|Downloading):\s+(?P<path>.+?)\s+\.\.\.\s+"
+        r"(?P<progress>\d{1,3})%(?=\s|$)",
+        re.IGNORECASE,
+    )
+    deletion_pattern = re.compile(
+        r"^(?P<operation>Deleting item|Deleting local file|Moving this local file):\s*(?P<path>.+)$",
+        re.IGNORECASE,
+    )
+    processing_pattern = re.compile(r"^Processing\s+(?P<count>\d+)\s+OneDrive\s+items", re.IGNORECASE)
+    failed_item_pattern = re.compile(r"^Failed to (?P<operation>upload|download):\s*(?P<path>.+)$", re.IGNORECASE)
+    failed_summary_pattern = re.compile(r"^Failed items to upload to/from Microsoft OneDrive:\s*(?P<count>\d+)", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        self._pending_error_summary = ""
+        self._pending_error_path = ""
+
+    def classify(self, message: str) -> dict[str, Any] | None:
+        text = message.strip()
+        if not text:
+            return None
+
+        lowered = text.lower()
+
+        if text.startswith("ERROR:"):
+            self._pending_error_summary = text.split("ERROR:", 1)[1].strip()
+            self._pending_error_path = ""
+            return {"type": "error", "summary": self._pending_error_summary}
+
+        if self._pending_error_summary and text.startswith("Path:"):
+            path = text.split("Path:", 1)[1].strip()
+            if path and path != "(not available)":
+                self._pending_error_path = path
+            return None
+
+        if self._pending_error_summary and text.startswith("Error Message:"):
+            detail = text.split("Error Message:", 1)[1].strip()
+            event = {
+                "type": "error",
+                "summary": self._pending_error_summary,
+                "detail": detail,
+            }
+            if self._pending_error_path:
+                event["path"] = self._pending_error_path
+            self._pending_error_summary = ""
+            self._pending_error_path = ""
+            return event
+
+        if self._pending_error_summary and not (
+            text.startswith("Calling Function:") or text.startswith("Disk Space")
+        ):
+            self._pending_error_summary = ""
+            self._pending_error_path = ""
+
+        if "authorise this application by" in lowered or "--reauth and re-authorise this client" in lowered:
+            return {"type": "authentication-required", "state": "authentication-required"}
+        if "opening the microsoft authorisation url in your default browser" in lowered:
+            return {"type": "authentication-browser-opened", "state": "authentication-required"}
+        if "the onedrive api was initialised successfully" in lowered:
+            return {"type": "authentication-complete", "state": "ready"}
+        if "calling function: testnetwork()" in lowered:
+            return {"type": "network-check", "state": "connecting"}
+        if "network connection issue" in lowered:
+            return {"type": "network-unavailable", "state": "offline"}
+        if "--resync is required" in lowered or "before using --resync" in lowered:
+            return {"type": "resync-required", "state": "action-required"}
+        if "to delete a large volume of data use" in lowered:
+            return {"type": "large-delete-approval-required", "state": "action-required"}
+        if "sync with microsoft onedrive has completed, however there are items that failed to sync" in lowered:
+            return {"type": "sync-complete", "state": "completed-with-errors"}
+        if (
+            "sync with microsoft onedrive is complete" in lowered
+            or "total number of local file(s) added or changed" in lowered
+            or "no changes or items that can be applied were discovered" in lowered
+        ):
+            return {"type": "sync-complete", "state": "completed"}
+        if "initializing the onedrive api" in lowered:
+            return {"type": "sync-phase", "state": "initializing"}
+        if "starting a sync with microsoft onedrive" in lowered:
+            return {"type": "sync-phase", "state": "syncing"}
+        if "unknown key in config file:" in lowered:
+            key = text.split(":", 1)[1].strip() if ":" in text else ""
+            return {"type": "configuration-error", "state": "error", "key": key}
+
+        processing = self.processing_pattern.match(text)
+        if processing:
+            return {
+                "type": "sync-phase",
+                "state": "processing",
+                "itemsRemaining": int(processing.group("count")),
+            }
+        if "number of items to download from microsoft onedrive" in lowered or "onedrive client requested to create" in lowered:
+            return {"type": "sync-phase", "state": "processing"}
+
+        failed_summary = self.failed_summary_pattern.match(text)
+        if failed_summary:
+            return {
+                "type": "failed-items-summary",
+                "state": "completed-with-errors",
+                "count": int(failed_summary.group("count")),
+            }
+        failed_item = self.failed_item_pattern.match(text)
+        if failed_item:
+            return {
+                "type": "failed-item",
+                "operation": failed_item.group("operation").lower(),
+                "path": failed_item.group("path").strip(),
+            }
+
+        progress = self.progress_pattern.match(text)
+        if progress:
+            return {
+                "type": "transfer",
+                "state": "syncing",
+                "operation": progress.group("operation").lower(),
+                "path": progress.group("path").strip(),
+                "progress": min(100, int(progress.group("progress"))),
+                "complete": int(progress.group("progress")) >= 100,
+            }
+        transfer = self.transfer_pattern.match(text)
+        if transfer:
+            progress_value = transfer.group("progress")
+            complete = bool(transfer.group("done")) or progress_value == "100"
+            event: dict[str, Any] = {
+                "type": "transfer",
+                "state": "syncing",
+                "operation": transfer.group("operation").lower(),
+                "path": transfer.group("path").strip(),
+                "complete": complete,
+            }
+            if progress_value is not None:
+                event["progress"] = min(100, int(progress_value))
+            return event
+        deletion = self.deletion_pattern.match(text)
+        if deletion:
+            return {
+                "type": "transfer",
+                "state": "syncing",
+                "operation": deletion.group("operation").lower(),
+                "path": deletion.group("path").strip(),
+                "complete": True,
+            }
+        return None
+
+
+class JsonlWriter:
+    def __init__(self, events_file: Path) -> None:
+        events_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Each service start begins a new event session. Keep only classified
+        # events: all original stdout/stderr still goes to the journal.
+        self._file = events_file.open("w", encoding="utf-8", buffering=1)
+        self._records: deque[str] = deque(maxlen=256)
+        self._written = 0
+        os.chmod(events_file, 0o600)
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+    def write(self, stream: str, message: str, event: dict[str, Any] | None) -> None:
+        if event is None:
+            return
+        with self._lock:
+            self._sequence += 1
+            record = {
+                "schemaVersion": SCHEMA_VERSION,
+                "timestamp": event_timestamp(),
+                "sequence": self._sequence,
+                "stream": stream,
+                "message": message,
+                "event": event,
+            }
+            # Bound both record count and individual log message size.
+            record["message"] = message[:8192]
+            for key, value in record["event"].items():
+                if isinstance(value, str):
+                    record["event"][key] = value[:8192]
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            self._records.append(line)
+            self._written += 1
+            if self._written >= 512:
+                self._file.seek(0)
+                self._file.truncate()
+                self._file.writelines(self._records)
+                self._written = len(self._records)
+            else:
+                self._file.write(line)
+            self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class OneDriveSupervisor:
+    def __init__(self, command: list[str], events_file: Path) -> None:
+        self._command = command
+        self._writer = JsonlWriter(events_file)
+        self._classifiers = {
+            "stdout": EventClassifier(),
+            "stderr": EventClassifier(),
+        }
+        self._child: subprocess.Popen[bytes] | None = None
+        self._received_signal: int | None = None
+        self._signal_lock = threading.Lock()
+
+    def _forward_signal(self, signal_number: int, _frame: object) -> None:
+        with self._signal_lock:
+            self._received_signal = signal_number
+            child = self._child
+        if child is not None and child.poll() is None:
+            child.send_signal(signal_number)
+
+    def _relay_stream(self, stream_name: str, stream: BinaryIO, destination_fd: int) -> None:
+        classifier = self._classifiers[stream_name]
+        try:
+            for raw_line in iter(stream.readline, b""):
+                try:
+                    write_all(destination_fd, raw_line)
+                except OSError:
+                    # Journald might be unavailable during shutdown. Continue recording events.
+                    pass
+                message = decoded_message(raw_line)
+                self._writer.write(stream_name, message, classifier.classify(message))
+        finally:
+            stream.close()
+
+    def run(self) -> int:
+        try:
+            self._child = subprocess.Popen(
+                self._command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except OSError as error:
+            print(f"Unable to start OneDrive client: {error}", file=sys.stderr)
+            self._writer.close()
+            return 127
+
+        previous_handlers = {number: signal.getsignal(number) for number in SIGNALS_TO_FORWARD}
+        for number in SIGNALS_TO_FORWARD:
+            signal.signal(number, self._forward_signal)
+
+        assert self._child.stdout is not None
+        assert self._child.stderr is not None
+        threads = [
+            threading.Thread(target=self._relay_stream, args=("stdout", self._child.stdout, 1), daemon=True),
+            threading.Thread(target=self._relay_stream, args=("stderr", self._child.stderr, 2), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+
+        return_code = self._child.wait()
+        for thread in threads:
+            thread.join()
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
+        self._writer.close()
+
+        if return_code < 0:
+            terminating_signal = -return_code
+            signal.signal(terminating_signal, signal.SIG_DFL)
+            os.kill(os.getpid(), terminating_signal)
+            raise AssertionError("unreachable")
+        return return_code
+
+
+def command_from_config(config_file: Path) -> list[str]:
+    with config_file.open("rb") as file:
+        config = tomllib.load(file)
+    onedrive = config.get("onedrive")
+    if not isinstance(onedrive, dict):
+        raise ValueError("missing [onedrive] table")
+
+    config_dir = onedrive.get("config_dir")
+    if not isinstance(config_dir, str) or not config_dir.strip():
+        raise ValueError("[onedrive].config_dir must be a non-empty string")
+
+    binary = onedrive.get("binary", "/usr/bin/onedrive")
+    if not isinstance(binary, str) or not binary.strip():
+        raise ValueError("[onedrive].binary must be a non-empty string")
+
+    extra_args = onedrive.get("extra_args", [])
+    if not isinstance(extra_args, list) or not all(isinstance(argument, str) for argument in extra_args):
+        raise ValueError("[onedrive].extra_args must be an array of strings")
+
+    expanded_config_dir = os.path.expandvars(os.path.expanduser(config_dir))
+    return [binary, "--monitor", f"--confdir={expanded_config_dir}", *extra_args]
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--events-file", required=True, type=Path)
+    parser.add_argument("--config", type=Path, help="TOML configuration containing [onedrive].config_dir")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to supervise, after --")
+    arguments = parser.parse_args()
+    if arguments.command[:1] == ["--"]:
+        arguments.command = arguments.command[1:]
+    if arguments.config is not None and arguments.command:
+        parser.error("--config and a command after -- cannot be used together")
+    if arguments.config is None and not arguments.command:
+        parser.error("a OneDrive command is required after --")
+    return arguments
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        command = command_from_config(arguments.config) if arguments.config is not None else arguments.command
+    except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
+        print(f"Unable to load OneDrive wrapper configuration: {error}", file=sys.stderr)
+        return 2
+    return OneDriveSupervisor(command, arguments.events_file).run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

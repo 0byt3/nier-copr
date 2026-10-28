@@ -1,0 +1,28 @@
+[Unit]
+Description=OneDrive account %i
+Documentation=https://github.com/abraunegg/onedrive
+DefaultDependencies=no
+Requires=basic.target
+After=basic.target network-online.target default.target
+Wants=network-online.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+ProtectSystem=full
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RuntimeDirectory=nier-onedrive-%i
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=LC_ALL=C.UTF-8
+ExecStart=/usr/bin/nier-onedrive-monitor --events-file %t/nier-onedrive-%i/events.jsonl --config "%E/nier/onedrive/accounts/%i/monitor-wrapper.toml"
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=78
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

@@ -1,11 +1,10 @@
 Name:           onedrive
 Version:        2.5.12
-Release:        1%{?dist}
+Release:        4%{?dist}
 Summary:        OneDrive Free Client written in D
 License:        GPL-3.0-only
 URL:            https://github.com/abraunegg/onedrive
 Source0:        https://github.com/abraunegg/onedrive/archive/v%{version}/onedrive-v%{version}.tar.gz
-
 ExclusiveArch:  %{ldc_arches}
 BuildRequires:  dbus-devel
 BuildRequires:  ldc
@@ -51,5 +50,14 @@ chmod a-x %{buildroot}/%{_mandir}/man1/%{name}*
 %config(noreplace) %{_sysconfdir}/logrotate.d/onedrive
 
 %changelog
+* Wed Oct 28 2026 Nier maintainers - 2.5.12-4
+- Move desktop integration into the separate nier-onedrive package
+
+* Tue Oct 27 2026 Nier maintainers - 2.5.12-3
+- Add terminal account setup, independent services and per-account bar widgets
+
+* Tue Oct 27 2026 Nier maintainers - 2.5.12-2
+- Include Nier OneDrive widget, bounded monitor events and user service integration
+
 * Sun Oct 25 2026 neir-copr - 2.5.12-1
 - Package upstream release 2.5.12

@@ -355,7 +355,14 @@ download_sources() {
         [[ -z "${url}" ]] && continue
         filename="${url##*/}"
         dest_path="${sources_dir}/${filename}"
-        if [[ -f "${dest_path}" ]]; then
+        if [[ "${url}" != *://* ]]; then
+            if [[ "${url}" != "${filename}" || "${filename}" == .* || ! -f "${spec_file%/*}/sources/${filename}" ]]; then
+                log_error "Missing or invalid local source: ${url}"
+                return 1
+            fi
+            cp "${spec_file%/*}/sources/${filename}" "${dest_path}"
+            log_info "Staged local source: ${filename}"
+        elif [[ -f "${dest_path}" ]]; then
             log_info "Using cached source: ${filename}"
         else
             log_info "Downloading ${url}..."
@@ -542,7 +549,7 @@ process_package() {
     rm -rf "${pkg_work_dir}"
     mkdir -p "${pkg_work_dir}"
 
-    if [[ "${LOCAL_SOURCE}" == "1" ]]; then
+    if [[ "${LOCAL_SOURCE}" == "1" && ! -d "${pkg_dir}/sources" ]]; then
         stage_local_source_tarball "${pkg_dir}" "${PACKAGE_NAME}" "${expected_rpm_version}" "${pkg_work_dir}/SOURCES"
     else
         download_sources "${spec_file}" "${latest_version}" "${pkg_work_dir}/SOURCES" "${PACKAGE_NAME}"
